@@ -1,48 +1,135 @@
-const port = process.env.PORT || 3000; // Render сам скажет, какой порт использовать
-const io = require("socket.io")(port, {
-    cors: {
-        origin: "*", // Разрешаем доступ всем (вашему сайту с чатом)
-        methods: ["GET", "POST"]
+<?php
+require 'db.php';
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *'); // Разрешаем запросы
+
+// Получаем JSON данные от JS
+$input = file_get_contents('php://input');
+$data = json_decode($input, true);
+
+if (!$data) {
+    echo json_encode(['status' => 'error', 'message' => 'No data received']);
+    exit;
+}
+
+$action = $data['action'] ?? '';
+
+try {
+    // --- 1. РЕГИСТРАЦИЯ ---
+    if ($action === 'register') {
+        $u = trim($data['username']);
+        $p = password_hash(trim($data['password']), PASSWORD_DEFAULT);
+
+        // Проверка на дубликат имени
+        $stmt = $pdo->prepare("SELECT id FROM users WHERE username = ?");
+        $stmt->execute([$u]);
+        if ($stmt->fetch()) {
+            echo json_encode(['status' => 'error', 'message' => 'Имя пользователя уже занято']);
+            exit;
+        }
+
+        $stmt = $pdo->prepare("INSERT INTO users (username, password) VALUES (?, ?)");
+        $stmt->execute([$u, $p]);
+        echo json_encode(['status' => 'success']);
+        exit;
     }
-});
 
-console.log(`📡 Сигнальный сервер запущен на порту ${port}`);
+    // --- 2. ВХОД ---
+    if ($action === 'login') {
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE username = ?");
+        $stmt->execute([$data['username']]);
+        $user = $stmt->fetch();
 
-io.on("connection", (socket) => {
-    console.log("Новое подключение:", socket.id);
+        if ($user && password_verify($data['password'], $user['password'])) {
+            unset($user['password']); // Убираем хеш перед отправкой
+            echo json_encode(['status' => 'success', 'user' => $user]);
+        } else {
+            echo json_encode(['status' => 'error', 'message' => 'Неверный логин или пароль']);
+        }
+        exit;
+    }
 
-    // --- ЛОГИКА СИГНАЛИЗАЦИИ (СВАХА) ---
-    
-    // 1. Клиент А отправляет свои координаты (Offer)
-    socket.on("offer", (data) => {
-        // data.target_id - это socket.id получателя (или его room)
-        socket.to(data.target_id).emit("offer", {
-            sdp: data.sdp,
-            sender_id: socket.id
-        });
-    });
+    // --- 3. ПОЛУЧИТЬ КОНТАКТЫ (ДРУЗЕЙ) ---
+    if ($action === 'get_contacts') {
+        $my_id = $data['my_id'];
+        
+        // Выбираем друзей и считаем количество непрочитанных сообщений от них
+        $sql = "SELECT u.id, u.username, u.avatar,
+                (SELECT COUNT(*) FROM messages m 
+                 WHERE m.sender_id = u.id 
+                 AND m.receiver_id = ? 
+                 AND m.is_read = 0) as unread_count
+                FROM users u 
+                JOIN friends f ON u.id = f.friend_id 
+                WHERE f.user_id = ?";
+        
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$my_id, $my_id]);
+        echo json_encode($stmt->fetchAll());
+        exit;
+    }
 
-    // 2. Клиент Б отвечает (Answer)
-    socket.on("answer", (data) => {
-        socket.to(data.target_id).emit("answer", {
-            sdp: data.sdp,
-            sender_id: socket.id
-        });
-    });
+    // --- 4. ДОБАВИТЬ ДРУГА ---
+    if ($action === 'add_friend') {
+        $my_id = $data['my_id'];
+        $friend_name = trim($data['friend_name']);
 
-    // 3. Обмен ICE кандидатами (пути в сети)
-    socket.on("ice-candidate", (data) => {
-        socket.to(data.target_id).emit("ice-candidate", data.candidate);
-    });
+        // Ищем ID друга по имени
+        $stmt = $pdo->prepare("SELECT id FROM users WHERE username = ?");
+        $stmt->execute([$friend_name]);
+        $friend = $stmt->fetch();
 
-    // 4. (Для теста) Простое перенаправление сообщений
-    socket.on("join_room", (room) => {
-        socket.join(room);
-        console.log(`Socket ${socket.id} зашел в комнату ${room}`);
-    });
-    
-    socket.on("message", (data) => {
-        // Отправить всем в комнате, кроме меня
-        socket.to(data.room).emit("message", data.msg);
-    });
-});
+        if (!$friend) {
+            echo json_encode(['status' => 'error', 'message' => 'Пользователь не найден']);
+            exit;
+        }
+        if ($friend['id'] == $my_id) {
+            echo json_encode(['status' => 'error', 'message' => 'Нельзя добавить себя']);
+            exit;
+        }
+
+        // Добавляем связь в обе стороны
+        try {
+            $pdo->prepare("INSERT INTO friends (user_id, friend_id) VALUES (?, ?)")->execute([$my_id, $friend['id']]);
+            $pdo->prepare("INSERT INTO friends (user_id, friend_id) VALUES (?, ?)")->execute([$friend['id'], $my_id]);
+            echo json_encode(['status' => 'success']);
+        } catch (Exception $e) {
+            echo json_encode(['status' => 'error', 'message' => 'Пользователь уже в списке друзей']);
+        }
+        exit;
+    }
+
+    // --- 5. ПОЛУЧИТЬ ИСТОРИЮ ЧАТА ---
+    if ($action === 'get_chat') {
+        $my_id = $data['my_id'];
+        $other_id = $data['other_id'];
+
+        // Помечаем сообщения как прочитанные
+        $pdo->prepare("UPDATE messages SET is_read = 1 WHERE sender_id = ? AND receiver_id = ?")
+            ->execute([$other_id, $my_id]);
+
+        // Загружаем сообщения
+        $stmt = $pdo->prepare("SELECT * FROM messages 
+            WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?) 
+            ORDER BY created_at ASC");
+        $stmt->execute([$my_id, $other_id, $other_id, $my_id]);
+        
+        echo json_encode(['messages' => $stmt->fetchAll()]);
+        exit;
+    }
+
+    // --- 6. СОХРАНИТЬ СООБЩЕНИЕ (ИСТОРИЯ) ---
+    // Это сообщение уже улетело через Socket.io, но нам нужно сохранить его в БД
+    if ($action === 'send_message') {
+        $stmt = $pdo->prepare("INSERT INTO messages (sender_id, receiver_id, message, type) VALUES (?, ?, ?, ?)");
+        $res = $stmt->execute([$data['sender_id'], $data['receiver_id'], $data['message'], $data['type']]);
+        
+        if($res) echo json_encode(['status' => 'success']);
+        else echo json_encode(['status' => 'error']);
+        exit;
+    }
+
+} catch (PDOException $e) {
+    echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+}
+?>
